@@ -85,7 +85,10 @@ def get_meeting(db_path: str, meeting_id: int) -> Optional[Dict[str, Any]]:
     # decode json fields
     for key in ("segments_json", "participants_json", "meta_json"):
         try:
-            data[key] = json.loads(data.get(key) or "{}")[0] if key == "segments_json" else json.loads(data.get(key) or "{}")
-        except Exception:
-            data[key] = {} if key != "segments_json" else []
+            if key == "segments_json":
+                data[key] = json.loads(data.get(key) or "[]")
+            else:
+                data[key] = json.loads(data.get(key) or "{}")
+        except json.JSONDecodeError:
+            data[key] = [] if key == "segments_json" else {}
     return data

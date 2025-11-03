@@ -193,19 +193,14 @@ def create_app():
                     summary = gr.Textbox(label="Summary", lines=6, interactive=False)
                     action_items = gr.JSON(label="Action Items")
 
-            # 저장 폼(모달 대체: 가시성 토글)
-            with gr.Group(visible=False) as save_modal:
-                gr.Markdown("### 회의록 저장")
+            # 저장 패널: 전사 후 자동 표시. 단일 '저장' 버튼으로 저장 수행.
+            with gr.Group(visible=False) as save_panel:
+                gr.Markdown("### 저장 정보")
                 save_name = gr.Textbox(label="회의록 이름", placeholder="예: 2025-11-03 제품 기획 회의")
                 save_date = gr.Textbox(label="회의록 날짜 (YYYY-MM-DD)", value=datetime.now().strftime("%Y-%m-%d"))
-                participants_help = (
-                    "참석자 매핑을 입력하세요 (한 줄에 하나). 예:\n"
-                    "SPEAKER_00=홍길동\nSPEAKER_01=김철수"
-                )
-                participants_text = gr.Textbox(label="참석자 매핑", lines=5, placeholder=participants_help)
-                with gr.Row():
-                    save_confirm = gr.Button("저장 실행", variant="primary")
-                    save_cancel = gr.Button("취소")
+                gr.Markdown("참석자 매핑을 편집하세요 (SPEAKER_ID → 이름). 비워두면 원래 라벨을 사용합니다.")
+                participants_df = gr.Dataframe(headers=["speaker_id", "name"], datatype=["str", "str"], row_count=(0, "dynamic"), col_count=(2, "fixed"), label="참석자 매핑")
+                save_feedback = gr.Markdown(visible=False)
 
         # 헬퍼: 목록 로드
         def _load_meetings():
@@ -254,43 +249,39 @@ def create_app():
                     audio_path = getattr(uploaded, 'name', None) or uploaded
 
             if not audio_path:
-                return "", "", [], [], "", ""
+                return "", "", [], [], "", "", gr.update(visible=False), gr.update(value=[])
 
             t, s, a, segs, apath = run_transcription(type('F', (), {'name': audio_path}), model, mode, use_api_sum, api_key)
             # full_text, summary, actions, segments, audio_path
-            return t, s, a, segs, apath, t
+            # 참가자 기본 행 구성: 고유 speaker_id 목록
+            uniq = []
+            seen = set()
+            for seg in (segs or []):
+                sid = seg.get("speaker")
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    uniq.append([sid, ""])  # 이름은 비워둠
+            return t, s, a, segs, apath, t, gr.update(visible=True), gr.update(value=uniq)
 
         transcribe_btn.click(
             fn=_choose_and_run,
             inputs=[audio_upload, mic_record, model_select, mode_select, use_api_summary, api_key_input],
-            outputs=[transcript, summary, action_items, last_segments, last_audio_path, last_transcript_text],
+            outputs=[transcript, summary, action_items, last_segments, last_audio_path, last_transcript_text, save_panel, participants_df],
         )
 
-        # 저장 모달 열기/닫기
-        def open_save_modal():
-            return gr.update(visible=True)
-
-        def close_save_modal():
-            return gr.update(visible=False)
-
-        save_btn.click(fn=open_save_modal, outputs=[save_modal])
-        save_cancel.click(fn=close_save_modal, outputs=[save_modal])
-
         # 저장 실행
-        def _parse_participants(text: str) -> Dict[str, str]:
+        def _parse_participants_from_df(rows: List[List[str]]) -> Dict[str, str]:
             mapping: Dict[str, str] = {}
-            for line in (text or "").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
+            for row in (rows or []):
+                if not row:
                     continue
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    k, v = k.strip(), v.strip()
-                    if k and v:
-                        mapping[k] = v
+                sid = (row[0] or "").strip()
+                nm = (row[1] or "").strip() if len(row) > 1 else ""
+                if sid:
+                    mapping[sid] = nm
             return mapping
 
-        def do_save(name: str, date_text: str, participants_map_text: str, segs: List[Dict], apath: str, full_text: str):
+        def do_save(name: str, date_text: str, participants_rows: List[List[str]], segs: List[Dict], apath: str, full_text: str):
             if not name:
                 name = f"회의록_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             try:
@@ -299,13 +290,13 @@ def create_app():
                 date_text = datetime.now().strftime("%Y-%m-%d")
 
             # 참가자 매핑 파싱 및 스피커 이름 치환
-            pmap = _parse_participants(participants_map_text)
+            pmap = _parse_participants_from_df(participants_rows)
             # 세그먼트 복사 및 레이블 치환
             resolved_segments: List[Dict] = []
             for seg in (segs or []):
                 new_seg = dict(seg)
                 label = new_seg.get("speaker")
-                if label in pmap:
+                if label in pmap and pmap[label]:
                     new_seg["speaker"] = pmap[label]
                 resolved_segments.append(new_seg)
 
@@ -336,23 +327,23 @@ def create_app():
                 meta={"source": "ui_app"},
             )
 
-            # 저장 후: 모달 닫고 목록 페이지로 전환 + 목록 갱신
+            # 저장 후: 목록 페이지로 전환 + 목록 갱신
             list_choices = _load_meetings()
             success_msg = f"저장 완료 (ID: {meeting_id})"
             return (
-                gr.update(visible=False),  # close modal
                 gr.update(visible=True),   # show list page
                 gr.update(visible=False),  # hide transcribe page
                 "list",
                 gr.update(choices=list_choices, value=None),
                 success_msg,
+                gr.update(visible=False),  # hide save panel
             )
 
-        # 저장 버튼 동작 연결
-        save_confirm.click(
+        # 단일 저장 버튼: 입력값으로 즉시 저장 수행
+        save_btn.click(
             fn=do_save,
-            inputs=[save_name, save_date, participants_text, last_segments, last_audio_path, last_transcript_text],
-            outputs=[save_modal, page_list, page_transcribe, page_state, meetings_dropdown, gr.Markdown.update()],
+            inputs=[save_name, save_date, participants_df, last_segments, last_audio_path, last_transcript_text],
+            outputs=[page_list, page_transcribe, page_state, meetings_dropdown, save_feedback, save_panel],
         )
 
         # 회의록 열기
